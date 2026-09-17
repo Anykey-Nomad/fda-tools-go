@@ -1,4 +1,4 @@
-# fda2wav — FDA Audio Converter
+# fda-tools-go — FDA Audio Converter
 
 [![Go Version](https://img.shields.io/badge/Go-1.27.1+-00ADD8?logo=go)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT%20%2B%20Non--Commercial-blue.svg)](LICENSE)
@@ -24,7 +24,7 @@ FDA — проприетарный аудиоформат компании **Rel
 Требуется **Go 1.27.1** или выше.
 
 ```bash
-cd fda2wav
+cd fda-tools-go
 go build .
 ```
 
@@ -32,7 +32,7 @@ go build .
 
 ### Простой способ (Drag & Drop)
 
-В Windows вы можете вообще не использовать командную строку. Просто выделите нужные файлы или папки в Проводнике и перетащите их на файл `fda2wav.exe`:
+В Windows вы можете вообще не использовать командную строку. Просто выделите нужные файлы или папки в Проводнике и перетащите их на файл `fda-tools-go.exe`:
 
 - Перетащите **.fda** файл — он автоматически декодируется в `.wav`.
 - Перетащите **.wav** файл — он автоматически закодируется в `.fda` (с битрейтом HQ, 2048).
@@ -43,8 +43,8 @@ go build .
 Для тонкой настройки или использования в скриптах (bat/bash) доступен интерфейс командной строки:
 
 ```bash
-fda2wav decode [options] <input.fda>   — Декодирование FDA → WAV
-fda2wav encode [options] <input.wav>   — Кодирование WAV → FDA
+fda-tools-go decode [options] <input.fda>   — Декодирование FDA → WAV
+fda-tools-go encode [options] <input.wav>   — Кодирование WAV → FDA
 ```
 
 ### Битрейты
@@ -139,7 +139,7 @@ Bitrate (kbps) = BlockBitrate x 86.1328125 x Channels / 1000
 
 ## Лицензия
 
-Оригинальный код проекта fda2wav распространяется под свободной лицензией **MIT License**.
+Оригинальный код проекта fda-tools-go распространяется под свободной лицензией **MIT License**.
 
 **ВНИМАНИЕ:** Скомпилированная программа и компонент быстрого преобразования Фурье (`fft.go`) предназначены **строго для некоммерческого использования**. 
 
