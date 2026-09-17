@@ -1,0 +1,5 @@
+*.wav
+*.fda
+*.exe
+fda-tools-go
+/.freebuff
