@@ -25,7 +25,7 @@ FDA — проприетарный аудиоформат компании **Rel
 
 ```bash
 cd fda2wav
-go build -o fda2wav .
+go build .
 ```
 
 ## Использование
