@@ -1,13 +1,13 @@
-# fda2wav License
+# fda-tools-go License
 
-The `fda2wav` project uses a split-license model. 
+The `fda-tools-go` project uses a split-license model. 
 The original code of this project is licensed under the MIT License. However, the compiled binary and specific components are subject to third-party licenses, including a strict **NON-COMMERCIAL USE** restriction for the FFT algorithm.
 
 See the sections below for details.
 
 ---
 
-## 1. Original fda2wav Code (MIT License)
+## 1. Original fda-tools-go Code (MIT License)
 
 Copyright (c) 2026 Глеб Стручев
 
@@ -35,7 +35,7 @@ SOFTWARE.
 
 ### A. mixfft.c (Jens Jorgen Nielsen) — NON-COMMERCIAL USE ONLY
 The file `fft.go` is a direct Go translation of `mixfft.c` v1. 
-Due to this dependency, the compiled binary of `fda2wav` and any use of the `fft.go` source code are restricted to **non-commercial purposes only**.
+Due to this dependency, the compiled binary of `fda-tools-go` and any use of the `fft.go` source code are restricted to **non-commercial purposes only**.
 
 Original Copyright and Terms:
 > Author: Jens Joergen Nielsen

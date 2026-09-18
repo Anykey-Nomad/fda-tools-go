@@ -30,10 +30,10 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "fda2wav - FDA audio converter (with Relic Codec)\n\n")
+	fmt.Fprintf(os.Stderr, "fda-tools-go - FDA audio converter (with Relic Codec)\n\n")
 	fmt.Fprintf(os.Stderr, "Usage:\n")
-	fmt.Fprintf(os.Stderr, "  fda2wav decode [options] <input.fda>   - Decode FDA to WAV\n")
-	fmt.Fprintf(os.Stderr, "  fda2wav encode [options] <input.wav>   - Encode WAV to FDA\n\n")
+	fmt.Fprintf(os.Stderr, "  fda-tools-go decode [options] <input.fda>   - Decode FDA to WAV\n")
+	fmt.Fprintf(os.Stderr, "  fda-tools-go encode [options] <input.wav>   - Encode WAV to FDA\n\n")
 	fmt.Fprintf(os.Stderr, "Decode options:\n")
 	fmt.Fprintf(os.Stderr, "  -info    Show FDA file info without conversion\n")
 	fmt.Fprintf(os.Stderr, "  -o       Output WAV file path\n\n")
@@ -173,7 +173,7 @@ func dragDropCmd() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("fda2wav Drag & Drop mode (bitrate=%d)\n\n", bitrate)
+	fmt.Printf("fda-tools-go Drag & Drop mode (bitrate=%d)\n\n", bitrate)
 
 	totalConverted, totalSkipped, totalFailed := 0, 0, 0
 

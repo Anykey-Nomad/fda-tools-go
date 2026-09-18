@@ -32,8 +32,8 @@ func WriteFDA(filename string, info *INFOChunk, channels int, data []byte) error
 
 	// Calculate FDA_ chunk size
 	// FDA_ contains INFO + DATA chunks
-	infoChunkSize := uint32(28) // szINFOChunk
-	dataChunkSize := uint32(4) + uint32(len(data)) // szDATAChunk + data
+	infoChunkSize := uint32(28)                              // szINFOChunk
+	dataChunkSize := uint32(4) + uint32(len(data))           // szDATAChunk + data
 	fdaChunkDataSize := infoChunkSize + dataChunkSize + 2*20 // INFO header + DATA header
 
 	// Write FDA_ container chunk
@@ -56,10 +56,10 @@ func WriteFDA(filename string, info *INFOChunk, channels int, data []byte) error
 
 func writeFDAChunkHeader(f *os.File, chunkType, chunkID string, chunkVer, chunkSize uint32, chunkName string) error {
 	hdr := struct {
-		ChunkType   [4]byte
-		ChunkID     [4]byte
-		ChunkVer    uint32
-		ChunkSize   uint32
+		ChunkType    [4]byte
+		ChunkID      [4]byte
+		ChunkVer     uint32
+		ChunkSize    uint32
 		LenChunkName uint32
 	}{
 		ChunkVer:  chunkVer,
@@ -84,7 +84,7 @@ func writeFDAChunkHeader(f *os.File, chunkType, chunkID string, chunkVer, chunkS
 
 func writeFBIFChunk(f *os.File) error {
 	pluginName := "RAW to FDA"
-	userName := "fda2wav"
+	userName := "fda-tools-go"
 	burnTime := time.Now().Format("January 02, 2006, 3:04:05 PM")
 
 	// Write chunk header
