@@ -9,9 +9,9 @@ import (
 )
 
 func main() {
-	// No arguments (double-click on the exe in Explorer) -> Drag & Drop mode.
+	// No arguments -> interactive browser mode.
 	if len(os.Args) < 2 {
-		dragDropCmd()
+		browserMode()
 		return
 	}
 

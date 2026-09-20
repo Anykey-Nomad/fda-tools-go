@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ebitengine/oto/v3"
 	"golang.org/x/term"
@@ -25,8 +25,16 @@ import (
 //
 // Also accepts directories: all .fda files inside are played one by one.
 //
-// Playback controls: Space = pause/resume, Q or Esc = skip file,
-// Ctrl+C = quit.
+// Playback controls:
+//
+//	Space      — pause / resume
+//	Right      — seek forward 10 s
+//	Left       — seek backward 10 s
+//	Shift+Right — seek forward 30 s
+//	Shift+Left  — seek backward 30 s
+//	R          — toggle repeat / loop
+//	Q / Esc    — skip file
+//	Ctrl+C     — quit
 func playCmd(args []string) {
 	// Collect operands, ignore any flags (e.g. --play passed twice).
 	var items []string
@@ -108,33 +116,29 @@ func playFile(path string) error {
 
 	duration := time.Duration(float64(len(pcm)) /
 		float64(fda.Info.Channels) / float64(fda.Info.SampleRate) * float64(time.Second))
-	fmt.Printf("Playing (%s)... Space: pause/resume, Q: skip, Ctrl+C: quit.\n",
+
+	fmt.Printf("Playing (%s)... Space: pause, ←/→: seek, R: repeat, Q: skip, Ctrl+C: quit.\n",
 		duration.Truncate(time.Second))
 
-	return playPCM(pcmDataToBytes(pcm), int(fda.Info.SampleRate), int(fda.Info.Channels))
+	return playLoop(pcmDataToBytes(pcm), int(fda.Info.SampleRate), int(fda.Info.Channels))
 }
 
-// countingReader counts the total number of bytes handed over to the player,
-// which (minus the device buffer) equals the playback position.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
+// ---------- raw-mode key reader ----------
 
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
-}
-
-// keyReader reads single keys from the terminal in raw mode. If the terminal
+// keyReader reads single keys from the terminal in raw mode.  If the terminal
 // cannot be switched to raw mode (e.g. stdin is a pipe), it degrades to
 // inactive and playback simply runs without key controls.
 type keyReader struct {
-	ch       chan byte
+	ch       chan keyEvent
 	fd       int
 	oldState *term.State
 	active   bool
+}
+
+type keyEvent struct {
+	kind  string // "space", "left", "right", "r", "q", "ctrlc", "unknown"
+	shift bool
+	raw   byte
 }
 
 func startKeyReader() *keyReader {
@@ -143,21 +147,54 @@ func startKeyReader() *keyReader {
 	if err != nil {
 		return &keyReader{active: false}
 	}
-	k := &keyReader{ch: make(chan byte, 8), fd: fd, oldState: old, active: true}
-	go func() {
-		defer close(k.ch)
-		buf := make([]byte, 1)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				k.ch <- buf[0]
-			}
+	k := &keyReader{ch: make(chan keyEvent, 16), fd: fd, oldState: old, active: true}
+	go k.readLoop()
+	return k
+}
+
+func (k *keyReader) readLoop() {
+	defer close(k.ch)
+	buf := make([]byte, 3)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if n == 0 {
 			if err != nil {
 				return
 			}
+			continue
 		}
-	}()
-	return k
+
+		b := buf[0]
+
+		// Escape sequence: ESC [ ...
+		if b == 0x1b && n >= 3 && buf[1] == '[' {
+			evt := keyEvent{kind: "unknown"}
+			switch buf[2] {
+			case 'C':
+				evt.kind = "right"
+				evt.shift = (n > 3 && buf[3] == ';')
+			case 'D':
+				evt.kind = "left"
+				evt.shift = (n > 3 && buf[3] == ';')
+			}
+			k.ch <- evt
+			continue
+		}
+
+		// Single bytes.
+		switch {
+		case b == ' ':
+			k.ch <- keyEvent{kind: "space"}
+		case b == 'r' || b == 'R':
+			k.ch <- keyEvent{kind: "r"}
+		case b == 'q' || b == 'Q':
+			k.ch <- keyEvent{kind: "q"}
+		case b == 3: // Ctrl+C
+			k.ch <- keyEvent{kind: "ctrlc"}
+		case unicode.IsPrint(rune(b)):
+			k.ch <- keyEvent{kind: "unknown", raw: b}
+		}
+	}
 }
 
 func (k *keyReader) restore() {
@@ -167,10 +204,55 @@ func (k *keyReader) restore() {
 	}
 }
 
-// playPCM feeds 16-bit interleaved PCM to the audio output device and
-// blocks until playback finishes. Space toggles pause/resume.
-func playPCM(data []byte, sampleRate, channels int) error {
-	// Set up the output context for this file's format.
+// ---------- playback core ----------
+
+// seekableReader wraps a byte slice and supports seeking via an offset.
+type seekableReader struct {
+	data   []byte
+	offset int64
+}
+
+func (r *seekableReader) Read(p []byte) (int, error) {
+	if r.offset >= int64(len(r.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.offset:])
+	r.offset += int64(n)
+	return n, nil
+}
+
+func (r *seekableReader) Seek(offset int64, whence int) (int64, error) {
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = r.offset + offset
+	case io.SeekEnd:
+		abs = int64(len(r.data)) + offset
+	default:
+		return 0, fmt.Errorf("invalid whence: %d", whence)
+	}
+	if abs < 0 {
+		abs = 0
+	}
+	if abs > int64(len(r.data)) {
+		abs = int64(len(r.data))
+	}
+	r.offset = abs
+	return abs, nil
+}
+
+func (r *seekableReader) remaining() int64 {
+	n := int64(len(r.data)) - r.offset
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// playLoop plays the PCM data, handling pause, seek, repeat, and skip.
+func playLoop(data []byte, sampleRate, channels int) error {
 	op := &oto.NewContextOptions{}
 	op.SampleRate = sampleRate
 	op.ChannelCount = channels
@@ -182,50 +264,118 @@ func playPCM(data []byte, sampleRate, channels int) error {
 	}
 	<-ready
 
-	src := &countingReader{r: bytes.NewReader(data)}
-	player := ctx.NewPlayer(io.NopCloser(src))
-	defer player.Close()
-
-	player.Play()
-
 	keys := startKeyReader()
 	defer keys.restore()
 
 	stdoutTTY := term.IsTerminal(int(os.Stdout.Fd()))
 	bytesPerSecond := int64(sampleRate * channels * 2)
-	total := time.Duration(int64(len(data)) / bytesPerSecond * int64(time.Second))
+	total := time.Duration(float64(len(data)) / float64(bytesPerSecond) * float64(time.Second))
 
-	printStatus := func(paused bool) {
+	paused := false
+	repeat := false
+
+	// Each iteration plays from sr.offset to the end (or a seek target).
+	sr := &seekableReader{data: data}
+	player := ctx.NewPlayer(io.NopCloser(sr))
+	defer player.Close()
+	player.Play()
+
+	// Returns the current playback position in bytes.
+	currentPos := func() int64 {
+		buf := int64(player.BufferedSize())
+		pos := sr.offset - buf
+		if pos < 0 {
+			return 0
+		}
+		return pos
+	}
+
+	printStatus := func() {
 		if !stdoutTTY {
 			return
 		}
-		pos := int64(0)
-		if p := src.n - int64(player.BufferedSize()); p > 0 {
-			pos = p
-		}
+		pos := currentPos()
 		if pos > int64(len(data)) {
 			pos = int64(len(data))
 		}
-		state := "playing"
-		if paused {
-			state = "paused "
+
+		// Progress bar: 30 chars wide.
+		barWidth := 30
+		filled := 0
+		if int64(len(data)) > 0 {
+			filled = int(float64(barWidth) * float64(pos) / float64(len(data)))
 		}
-		fmt.Printf("\r  [%s] %s / %s   ",
-			state,
-			(time.Duration(pos / bytesPerSecond * int64(time.Second))).Truncate(time.Second),
-			total)
+		if filled > barWidth {
+			filled = barWidth
+		}
+
+		state := "▶"
+		if paused {
+			state = "⏸"
+		}
+		repeatTag := ""
+		if repeat {
+			repeatTag = " 🔁"
+		}
+
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+		cur := time.Duration(pos / bytesPerSecond * int64(time.Second)).Truncate(time.Second)
+		fmt.Printf("\r  %s [%s] %s / %s%s   ",
+			state, bar,
+			cur, total, repeatTag)
 	}
 
-	paused := false
+	// rebuildPlayer tears down the current player and creates a new one
+	// starting from sr.offset (which has been set by a seek or repeat).
+	rebuildPlayer := func() {
+		player.Close()
+		player = ctx.NewPlayer(io.NopCloser(sr))
+		player.Play()
+	}
+
+	printStatus()
+
 	for {
+		// Check end-of-file.
+		if !paused && !player.IsPlaying() {
+			// If we are within a small tail margin, the track is done.
+			if sr.remaining() <= 0 {
+				if repeat {
+					sr.Seek(0, io.SeekStart)
+					rebuildPlayer()
+					printStatus()
+					continue
+				}
+				if stdoutTTY {
+					fmt.Println()
+				}
+				return nil
+			}
+			// Small tail can happen with oto buffering; just wait a beat.
+			time.Sleep(50 * time.Millisecond)
+			if !player.IsPlaying() && sr.remaining() <= 0 {
+				if repeat {
+					sr.Seek(0, io.SeekStart)
+					rebuildPlayer()
+					printStatus()
+					continue
+				}
+				if stdoutTTY {
+					fmt.Println()
+				}
+				return nil
+			}
+		}
+
 		select {
-		case b, ok := <-keys.ch:
+		case evt, ok := <-keys.ch:
 			if !ok {
-				keys.ch = nil // reader stopped; keep playing without controls
+				// Reader goroutine stopped — keep playing without controls.
+				keys.ch = nil
 				continue
 			}
-			switch b {
-			case ' ':
+			switch evt.kind {
+			case "space":
 				if paused {
 					player.Play()
 					paused = false
@@ -233,25 +383,62 @@ func playPCM(data []byte, sampleRate, channels int) error {
 					player.Pause()
 					paused = true
 				}
-				printStatus(paused)
-			case 'q', 'Q', 0x1b: // skip current file
+				printStatus()
+
+			case "r":
+				repeat = !repeat
+				printStatus()
+
+			case "right":
+				seekDelta := int64(10 * bytesPerSecond)
+				if evt.shift {
+					seekDelta = 30 * bytesPerSecond
+				}
+				newOff := currentPos() + seekDelta
+				if newOff > int64(len(data)) {
+					newOff = int64(len(data))
+				}
+				sr.Seek(newOff, io.SeekStart)
+				player.Close()
+				player = ctx.NewPlayer(io.NopCloser(sr))
+				if !paused {
+					player.Play()
+				}
+				printStatus()
+
+			case "left":
+				seekDelta := int64(-10 * bytesPerSecond)
+				if evt.shift {
+					seekDelta = -30 * bytesPerSecond
+				}
+				newOff := currentPos() + seekDelta
+				if newOff < 0 {
+					newOff = 0
+				}
+				sr.Seek(newOff, io.SeekStart)
+				player.Close()
+				player = ctx.NewPlayer(io.NopCloser(sr))
+				if !paused {
+					player.Play()
+				}
+				printStatus()
+
+			case "q":
 				if stdoutTTY {
 					fmt.Println()
 				}
 				return nil
-			case 3: // Ctrl+C (raw mode does not generate SIGINT)
+
+			case "ctrlc":
 				keys.restore()
-				fmt.Println()
+				if stdoutTTY {
+					fmt.Println()
+				}
 				os.Exit(0)
 			}
+
 		case <-time.After(100 * time.Millisecond):
-			if !paused && !player.IsPlaying() {
-				if stdoutTTY {
-					fmt.Println()
-				}
-				return nil
-			}
-			printStatus(paused)
+			printStatus()
 		}
 	}
 }
