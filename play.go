@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ebitengine/oto/v3"
+	"golang.org/x/term"
 )
 
 // playCmd implements the --play attribute and the "play" subcommand:
@@ -23,6 +24,9 @@ import (
 //	fda-tools-go <file.fda> --play
 //
 // Also accepts directories: all .fda files inside are played one by one.
+//
+// Playback controls: Space = pause/resume, Q or Esc = skip file,
+// Ctrl+C = quit.
 func playCmd(args []string) {
 	// Collect operands, ignore any flags (e.g. --play passed twice).
 	var items []string
@@ -104,13 +108,67 @@ func playFile(path string) error {
 
 	duration := time.Duration(float64(len(pcm)) /
 		float64(fda.Info.Channels) / float64(fda.Info.SampleRate) * float64(time.Second))
-	fmt.Printf("Playing (%s)... Press Ctrl+C to stop.\n", duration)
+	fmt.Printf("Playing (%s)... Space: pause/resume, Q: skip, Ctrl+C: quit.\n",
+		duration.Truncate(time.Second))
 
 	return playPCM(pcmDataToBytes(pcm), int(fda.Info.SampleRate), int(fda.Info.Channels))
 }
 
+// countingReader counts the total number of bytes handed over to the player,
+// which (minus the device buffer) equals the playback position.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// keyReader reads single keys from the terminal in raw mode. If the terminal
+// cannot be switched to raw mode (e.g. stdin is a pipe), it degrades to
+// inactive and playback simply runs without key controls.
+type keyReader struct {
+	ch       chan byte
+	fd       int
+	oldState *term.State
+	active   bool
+}
+
+func startKeyReader() *keyReader {
+	fd := int(os.Stdin.Fd())
+	old, err := term.MakeRaw(fd)
+	if err != nil {
+		return &keyReader{active: false}
+	}
+	k := &keyReader{ch: make(chan byte, 8), fd: fd, oldState: old, active: true}
+	go func() {
+		defer close(k.ch)
+		buf := make([]byte, 1)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				k.ch <- buf[0]
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return k
+}
+
+func (k *keyReader) restore() {
+	if k.active {
+		term.Restore(k.fd, k.oldState)
+		k.active = false
+	}
+}
+
 // playPCM feeds 16-bit interleaved PCM to the audio output device and
-// blocks until playback finishes.
+// blocks until playback finishes. Space toggles pause/resume.
 func playPCM(data []byte, sampleRate, channels int) error {
 	// Set up the output context for this file's format.
 	op := &oto.NewContextOptions{}
@@ -124,15 +182,76 @@ func playPCM(data []byte, sampleRate, channels int) error {
 	}
 	<-ready
 
-	player := ctx.NewPlayer(io.NopCloser(bytes.NewReader(data)))
+	src := &countingReader{r: bytes.NewReader(data)}
+	player := ctx.NewPlayer(io.NopCloser(src))
 	defer player.Close()
 
 	player.Play()
 
-	// Wait until playback is done (oto has no completion callback).
-	for player.IsPlaying() {
-		time.Sleep(50 * time.Millisecond)
+	keys := startKeyReader()
+	defer keys.restore()
+
+	stdoutTTY := term.IsTerminal(int(os.Stdout.Fd()))
+	bytesPerSecond := int64(sampleRate * channels * 2)
+	total := time.Duration(int64(len(data)) / bytesPerSecond * int64(time.Second))
+
+	printStatus := func(paused bool) {
+		if !stdoutTTY {
+			return
+		}
+		pos := int64(0)
+		if p := src.n - int64(player.BufferedSize()); p > 0 {
+			pos = p
+		}
+		if pos > int64(len(data)) {
+			pos = int64(len(data))
+		}
+		state := "playing"
+		if paused {
+			state = "paused "
+		}
+		fmt.Printf("\r  [%s] %s / %s   ",
+			state,
+			(time.Duration(pos / bytesPerSecond * int64(time.Second))).Truncate(time.Second),
+			total)
 	}
 
-	return nil
+	paused := false
+	for {
+		select {
+		case b, ok := <-keys.ch:
+			if !ok {
+				keys.ch = nil // reader stopped; keep playing without controls
+				continue
+			}
+			switch b {
+			case ' ':
+				if paused {
+					player.Play()
+					paused = false
+				} else {
+					player.Pause()
+					paused = true
+				}
+				printStatus(paused)
+			case 'q', 'Q', 0x1b: // skip current file
+				if stdoutTTY {
+					fmt.Println()
+				}
+				return nil
+			case 3: // Ctrl+C (raw mode does not generate SIGINT)
+				keys.restore()
+				fmt.Println()
+				os.Exit(0)
+			}
+		case <-time.After(100 * time.Millisecond):
+			if !paused && !player.IsPlaying() {
+				if stdoutTTY {
+					fmt.Println()
+				}
+				return nil
+			}
+			printStatus(paused)
+		}
+	}
 }
