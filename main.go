@@ -17,7 +17,18 @@ func main() {
 
 	cmd := os.Args[1]
 
+	// --play attribute in any position: play FDA directly from the console,
+	// without transcoding to WAV on disk.
+	for _, a := range os.Args[1:] {
+		if a == "--play" {
+			playCmd(os.Args[1:])
+			return
+		}
+	}
+
 	switch cmd {
+	case "play", "p":
+		playCmd(os.Args[2:])
 	case "decode", "d", "fda2wav":
 		os.Args = os.Args[1:] // Shift args
 		decodeCmd()
@@ -32,6 +43,7 @@ func main() {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "fda-tools-go - FDA audio converter (with Relic Codec)\n\n")
 	fmt.Fprintf(os.Stderr, "Usage:\n")
+	fmt.Fprintf(os.Stderr, "  fda-tools-go play <file.fda>                - Play FDA directly (no WAV on disk)\n")
 	fmt.Fprintf(os.Stderr, "  fda-tools-go decode [options] <input.fda>   - Decode FDA to WAV\n")
 	fmt.Fprintf(os.Stderr, "  fda-tools-go encode [options] <input.wav>   - Encode WAV to FDA\n\n")
 	fmt.Fprintf(os.Stderr, "Decode options:\n")

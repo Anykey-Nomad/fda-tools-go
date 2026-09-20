@@ -5,8 +5,10 @@ import (
 	"os"
 )
 
-// DecodeFDAtoWAV decodes Relic-compressed audio and writes a PCM WAV file
-func DecodeFDAtoWAV(filename string, fda *FDAFile) error {
+// DecodeFDAToPCM decodes Relic-compressed audio into an in-memory PCM buffer
+// (16-bit, interleaved) and returns the parsed FDA info alongside. No files
+// are written.
+func DecodeFDAToPCM(fda *FDAFile) ([]int16, error) {
 	// Init Relic decoder
 	channels := int(fda.Info.Channels)
 	bitrate := int(fda.Info.BlockBitrate)
@@ -14,13 +16,13 @@ func DecodeFDAtoWAV(filename string, fda *FDAFile) error {
 
 	decoder := relicInit(channels, bitrate, codecRate)
 	if decoder == nil {
-		return fmt.Errorf("failed to init Relic decoder (channels=%d, bitrate=%d, rate=%d)", channels, bitrate, codecRate)
+		return nil, fmt.Errorf("failed to init Relic decoder (channels=%d, bitrate=%d, rate=%d)", channels, bitrate, codecRate)
 	}
 	defer relicFree(decoder)
 
 	frameSize := relicGetFrameSize(decoder)
 	if frameSize == 0 {
-		return fmt.Errorf("invalid frame size")
+		return nil, fmt.Errorf("invalid frame size")
 	}
 
 	// Calculate total samples
@@ -63,6 +65,17 @@ func DecodeFDAtoWAV(filename string, fda *FDAFile) error {
 		}
 	}
 	fmt.Println()
+
+	return pcmData, nil
+}
+
+// DecodeFDAtoWAV decodes Relic-compressed audio and writes a PCM WAV file
+func DecodeFDAtoWAV(filename string, fda *FDAFile) error {
+	// Decode into memory (this prints decoding progress)
+	pcmData, err := DecodeFDAToPCM(fda)
+	if err != nil {
+		return err
+	}
 
 	// Write WAV file
 	if err := WriteWAV(filename, &fda.Info, pcmDataToBytes(pcmData)); err != nil {

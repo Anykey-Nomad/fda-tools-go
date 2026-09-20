@@ -11,6 +11,7 @@ FDA — проприетарный аудиоформат компании **Rel
 
 - **Декодирование**: FDA → WAV (PCM 16-bit)
 - **Кодирование**: WAV (PCM 16-bit) → FDA
+- **Воспроизведение**: FDA играет прямо в консоли (`--play`), без промежуточного WAV на диске
 - Полный парсинг структуры FDA-файлов
 - Декодирование/кодирование через **Relic Codec v1.6** (DCT-based lossy codec)
 - Поддержка моно и стерео звука
@@ -60,9 +61,20 @@ build.cmd
 Для тонкой настройки или использования в скриптах (bat/bash) доступен интерфейс командной строки:
 
 ```bash
+fda-tools-go play <file.fda>                — Воспроизведение FDA прямо в консоли
 fda-tools-go decode [options] <input.fda>   — Декодирование FDA → WAV
 fda-tools-go encode [options] <input.wav>   — Кодирование WAV → FDA
 ```
+
+Атрибут **`--play`** можно ставить в любое место команды — до или после имени файла:
+
+```bash
+fda-tools-go --play <file.fda>
+fda-tools-go <file.fda> --play
+```
+<arg_value><b88a6f17>Воспроизведение работает без перекодировки: FDA декодируется Relic-кодеком прямо в память
+и выводится на аудиоустройство, WAV-файл на диске не создаётся. Вместо файла можно указать
+папку — проиграются все `.fda` файлы в ней по очереди.
 
 ### Битрейты
 
@@ -86,6 +98,7 @@ fda-tools-go encode [options] <input.wav>   — Кодирование WAV → F
 | `wav.go` | Запись WAV-файлов |
 | `wav_reader.go` | Чтение WAV-файлов |
 | `decode.go` | Интеграция декодера с файловым I/O |
+| `play.go` | Воспроизведение FDA через аудиоустройство (oto) |
 
 ## Технические детали
 
@@ -145,6 +158,12 @@ Bitrate (kbps) = BlockBitrate x 86.1328125 x Channels / 1000
 **Лицензия**: Авторское право, **только для некоммерческого использования**. Коммерческое использование требует отдельного соглашения с авторами.
 
 Автор: Jens Jorgen Nielsen (October 2000)
+
+### [ebitengine/oto](https://github.com/ebitengine/oto)
+
+Библиотека низкоуровневого вывода звука (WASAPI на Windows, ALSA на Linux), используемая в режиме `play`.
+
+**Лицензия**: Apache License 2.0.
 
 ### [jTommy](mailto:jTommy@zmail.ru) — FDA & AIFC Specification
 

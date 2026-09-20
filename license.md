@@ -46,7 +46,17 @@ Original Copyright and Terms:
 > **For non-commercial use only.**
 > **A $100 fee must be paid if used commercially. Please contact the original author.**
 
-### B. Relic Codec Implementation (vgmstream)
+### B. ebitengine/oto (Sound Output Library) — Apache License 2.0
+The `play` mode uses the [ebitengine/oto/v3](https://github.com/ebitengine/oto) library for low-level audio output (WASAPI on Windows, ALSA on Linux).
+
+Licensed under the Apache License, Version 2.0:
+> Copyright The oto Authors
+>
+> Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
+>
+> http://www.apache.org/licenses/LICENSE-2.0
+
+### C. Relic Codec Implementation (vgmstream)
 The Relic Codec logic (`relic.go`, `relic_enc.go`) is derived and translated from the `vgmstream` project, which is licensed under the ISC License.
 
 Original vgmstream Copyright and License:
