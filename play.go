@@ -6,37 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-	"unicode"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/ebitengine/oto/v3"
-	"golang.org/x/term"
 )
 
-// playCmd implements the --play attribute and the "play" subcommand:
-// decode FDA in memory with the Relic codec and play it on the audio
-// device, without transcoding to WAV on disk.
-//
-// Accepted invocation forms (arg is an .fda file):
-//
-//	fda-tools-go play <file.fda>
-//	fda-tools-go --play <file.fda>
-//	fda-tools-go <file.fda> --play
-//
-// Also accepts directories: all .fda files inside are played one by one.
-//
-// Playback controls:
-//
-//	Space      — pause / resume
-//	Right      — seek forward 10 s
-//	Left       — seek backward 10 s
-//	Shift+Right — seek forward 30 s
-//	Shift+Left  — seek backward 30 s
-//	R          — toggle repeat / loop
-//	Q / Esc    — skip file
-//	Ctrl+C     — quit
+// playCmd implements the --play attribute and the "play" subcommand.
 func playCmd(args []string) {
-	// Collect operands, ignore any flags (e.g. --play passed twice).
 	var items []string
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
@@ -50,7 +29,6 @@ func playCmd(args []string) {
 		os.Exit(1)
 	}
 
-	// Expand directories into .fda file lists (in place).
 	var files []string
 	for _, item := range items {
 		info, err := os.Stat(item)
@@ -68,9 +46,9 @@ func playCmd(args []string) {
 				if entry.IsDir() {
 					continue
 				}
-				path := filepath.Join(item, entry.Name())
-				if strings.EqualFold(filepath.Ext(path), ".fda") {
-					files = append(files, path)
+				p := filepath.Join(item, entry.Name())
+				if strings.EqualFold(filepath.Ext(p), ".fda") {
+					files = append(files, p)
 				}
 			}
 			continue
@@ -93,7 +71,7 @@ func playCmd(args []string) {
 	}
 }
 
-// playFile decodes a single FDA file in memory and plays it on the audio device.
+// playFile decodes a single FDA file in memory and plays it with a bubbletea UI.
 func playFile(path string) error {
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext != ".fda" {
@@ -105,7 +83,6 @@ func playFile(path string) error {
 	if err != nil {
 		return err
 	}
-
 	fda.PrintInfo()
 
 	fmt.Printf("\nDecoding with Relic Codec...\n")
@@ -114,99 +91,52 @@ func playFile(path string) error {
 		return err
 	}
 
-	duration := time.Duration(float64(len(pcm)) /
-		float64(fda.Info.Channels) / float64(fda.Info.SampleRate) * float64(time.Second))
+	wavOut := strings.TrimSuffix(path, filepath.Ext(path)) + ".wav"
+	data := pcmDataToBytes(pcm)
+	sampleRate := int(fda.Info.SampleRate)
+	channels := int(fda.Info.Channels)
 
-	fmt.Printf("Playing (%s)... Space: pause, ←/→: seek, R: repeat, Q: skip, Ctrl+C: quit.\n",
-		duration.Truncate(time.Second))
-
-	return playLoop(pcmDataToBytes(pcm), int(fda.Info.SampleRate), int(fda.Info.Channels))
-}
-
-// ---------- raw-mode key reader ----------
-
-// keyReader reads single keys from the terminal in raw mode.  If the terminal
-// cannot be switched to raw mode (e.g. stdin is a pipe), it degrades to
-// inactive and playback simply runs without key controls.
-type keyReader struct {
-	ch       chan keyEvent
-	fd       int
-	oldState *term.State
-	active   bool
-}
-
-type keyEvent struct {
-	kind  string // "space", "left", "right", "r", "q", "ctrlc", "unknown"
-	shift bool
-	raw   byte
-}
-
-func startKeyReader() *keyReader {
-	fd := int(os.Stdin.Fd())
-	old, err := term.MakeRaw(fd)
-	if err != nil {
-		return &keyReader{active: false}
+	m := newPlayerModel(data, sampleRate, channels, wavOut, fda)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		return err
 	}
-	k := &keyReader{ch: make(chan keyEvent, 16), fd: fd, oldState: old, active: true}
-	go k.readLoop()
-	return k
+	return nil
 }
 
-func (k *keyReader) readLoop() {
-	defer close(k.ch)
-	buf := make([]byte, 3)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if n == 0 {
-			if err != nil {
-				return
-			}
-			continue
-		}
+// ---------- oto singleton ----------
 
-		b := buf[0]
+var (
+	otoCtx        *oto.Context
+	otoReady      sync.Once
+	otoSampleRate int
+	otoChannels   int
+)
 
-		// Escape sequence: ESC [ ...
-		if b == 0x1b && n >= 3 && buf[1] == '[' {
-			evt := keyEvent{kind: "unknown"}
-			switch buf[2] {
-			case 'C':
-				evt.kind = "right"
-				evt.shift = (n > 3 && buf[3] == ';')
-			case 'D':
-				evt.kind = "left"
-				evt.shift = (n > 3 && buf[3] == ';')
-			}
-			k.ch <- evt
-			continue
-		}
+func getOtoContext(sampleRate, channels int) (*oto.Context, error) {
+	var initErr error
+	otoReady.Do(func() {
+		op := &oto.NewContextOptions{}
+		op.SampleRate = sampleRate
+		op.ChannelCount = channels
+		op.Format = oto.FormatSignedInt16LE
 
-		// Single bytes.
-		switch {
-		case b == ' ':
-			k.ch <- keyEvent{kind: "space"}
-		case b == 'r' || b == 'R':
-			k.ch <- keyEvent{kind: "r"}
-		case b == 'q' || b == 'Q':
-			k.ch <- keyEvent{kind: "q"}
-		case b == 3: // Ctrl+C
-			k.ch <- keyEvent{kind: "ctrlc"}
-		case unicode.IsPrint(rune(b)):
-			k.ch <- keyEvent{kind: "unknown", raw: b}
+		var ready chan struct{}
+		otoCtx, ready, initErr = oto.NewContext(op)
+		if initErr == nil {
+			<-ready
 		}
+		otoSampleRate = sampleRate
+		otoChannels = channels
+	})
+	if initErr != nil {
+		return nil, initErr
 	}
+	return otoCtx, nil
 }
 
-func (k *keyReader) restore() {
-	if k.active {
-		term.Restore(k.fd, k.oldState)
-		k.active = false
-	}
-}
+// ---------- seekable reader ----------
 
-// ---------- playback core ----------
-
-// seekableReader wraps a byte slice and supports seeking via an offset.
 type seekableReader struct {
 	data   []byte
 	offset int64
@@ -221,28 +151,6 @@ func (r *seekableReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (r *seekableReader) Seek(offset int64, whence int) (int64, error) {
-	var abs int64
-	switch whence {
-	case io.SeekStart:
-		abs = offset
-	case io.SeekCurrent:
-		abs = r.offset + offset
-	case io.SeekEnd:
-		abs = int64(len(r.data)) + offset
-	default:
-		return 0, fmt.Errorf("invalid whence: %d", whence)
-	}
-	if abs < 0 {
-		abs = 0
-	}
-	if abs > int64(len(r.data)) {
-		abs = int64(len(r.data))
-	}
-	r.offset = abs
-	return abs, nil
-}
-
 func (r *seekableReader) remaining() int64 {
 	n := int64(len(r.data)) - r.offset
 	if n < 0 {
@@ -251,194 +159,295 @@ func (r *seekableReader) remaining() int64 {
 	return n
 }
 
-// playLoop plays the PCM data, handling pause, seek, repeat, and skip.
-func playLoop(data []byte, sampleRate, channels int) error {
-	op := &oto.NewContextOptions{}
-	op.SampleRate = sampleRate
-	op.ChannelCount = channels
-	op.Format = oto.FormatSignedInt16LE
-
-	ctx, ready, err := oto.NewContext(op)
-	if err != nil {
-		return fmt.Errorf("init audio: %w", err)
+func (r *seekableReader) seekTo(pos int64) {
+	if pos < 0 {
+		pos = 0
 	}
-	<-ready
+	if pos > int64(len(r.data)) {
+		pos = int64(len(r.data))
+	}
+	r.offset = pos
+}
 
-	keys := startKeyReader()
-	defer keys.restore()
+// ---------- bubbletea player ----------
 
-	stdoutTTY := term.IsTerminal(int(os.Stdout.Fd()))
-	bytesPerSecond := int64(sampleRate * channels * 2)
-	total := time.Duration(float64(len(data)) / float64(bytesPerSecond) * float64(time.Second))
+var (
+	playerStyleTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("170"))
+	playerStyleBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+	playerStyleDim   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	playerStyleOK    = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
+)
 
-	paused := false
-	repeat := false
+type playerTickMsg time.Time
 
-	// Each iteration plays from sr.offset to the end (or a seek target).
+type playerModel struct {
+	data         []byte
+	sampleRate   int
+	channels     int
+	wavOut       string
+	fda          *FDAFile
+	sr           *seekableReader
+	player       *oto.Player
+	ctx          *oto.Context
+	bytesPerSec  int64
+	total        time.Duration
+	paused       bool
+	repeat       bool
+	exporting    bool
+	exportDone   string // non-empty after export finishes
+	startTime    time.Time
+	pauseOffset  time.Duration
+	pauseStarted time.Time
+	quit         bool
+}
+
+func newPlayerModel(data []byte, sampleRate, channels int, wavOut string, fda *FDAFile) playerModel {
+	ctx, err := getOtoContext(sampleRate, channels)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Audio init error: %v\n", err)
+		os.Exit(1)
+	}
+
 	sr := &seekableReader{data: data}
 	player := ctx.NewPlayer(io.NopCloser(sr))
-	defer player.Close()
 	player.Play()
 
-	// Returns the current playback position in bytes.
-	currentPos := func() int64 {
-		buf := int64(player.BufferedSize())
-		pos := sr.offset - buf
-		if pos < 0 {
-			return 0
-		}
-		return pos
+	bps := int64(sampleRate * channels * 2)
+	total := time.Duration(float64(len(data)) / float64(bps) * float64(time.Second))
+
+	return playerModel{
+		data:        data,
+		sampleRate:  sampleRate,
+		channels:    channels,
+		wavOut:      wavOut,
+		fda:         fda,
+		sr:          sr,
+		player:      player,
+		ctx:         ctx,
+		bytesPerSec: bps,
+		total:       total,
+		startTime:   time.Now(),
 	}
+}
 
-	printStatus := func() {
-		if !stdoutTTY {
-			return
-		}
-		pos := currentPos()
-		if pos > int64(len(data)) {
-			pos = int64(len(data))
-		}
+func (m playerModel) Init() tea.Cmd {
+	return tea.Batch(tickCmd(), waitForExport(nil))
+}
 
-		// Progress bar: 30 chars wide.
-		barWidth := 30
-		filled := 0
-		if int64(len(data)) > 0 {
-			filled = int(float64(barWidth) * float64(pos) / float64(len(data)))
-		}
-		if filled > barWidth {
-			filled = barWidth
-		}
+func tickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return playerTickMsg(t)
+	})
+}
 
-		state := "▶"
-		if paused {
-			state = "⏸"
+func waitForExport(ch <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		if ch == nil {
+			return nil
 		}
-		repeatTag := ""
-		if repeat {
-			repeatTag = " 🔁"
-		}
-
-		bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-		cur := time.Duration(pos / bytesPerSecond * int64(time.Second)).Truncate(time.Second)
-		fmt.Printf("\r  %s [%s] %s / %s%s   ",
-			state, bar,
-			cur, total, repeatTag)
+		result := <-ch
+		return exportDoneMsg{path: result}
 	}
+}
 
-	// rebuildPlayer tears down the current player and creates a new one
-	// starting from sr.offset (which has been set by a seek or repeat).
-	rebuildPlayer := func() {
-		player.Close()
-		player = ctx.NewPlayer(io.NopCloser(sr))
-		player.Play()
-	}
+type exportDoneMsg struct{ path string }
 
-	printStatus()
+func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		return m, nil
 
-	for {
-		// Check end-of-file.
-		if !paused && !player.IsPlaying() {
-			// If we are within a small tail margin, the track is done.
-			if sr.remaining() <= 0 {
-				if repeat {
-					sr.Seek(0, io.SeekStart)
-					rebuildPlayer()
-					printStatus()
-					continue
+	case playerTickMsg:
+		if m.quit {
+			return m, tea.Quit
+		}
+		// Check end-of-file
+		if !m.paused && !m.player.IsPlaying() {
+			if m.sr.remaining() <= 0 {
+				if m.repeat {
+					m.sr.seekTo(0)
+					m.player.Close()
+					m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
+					m.player.Play()
+					m.startTime = time.Now()
+					return m, tickCmd()
 				}
-				if stdoutTTY {
-					fmt.Println()
-				}
-				return nil
-			}
-			// Small tail can happen with oto buffering; just wait a beat.
-			time.Sleep(50 * time.Millisecond)
-			if !player.IsPlaying() && sr.remaining() <= 0 {
-				if repeat {
-					sr.Seek(0, io.SeekStart)
-					rebuildPlayer()
-					printStatus()
-					continue
-				}
-				if stdoutTTY {
-					fmt.Println()
-				}
-				return nil
+				return m, tea.Quit
 			}
 		}
+		return m, tickCmd()
 
-		select {
-		case evt, ok := <-keys.ch:
-			if !ok {
-				// Reader goroutine stopped — keep playing without controls.
-				keys.ch = nil
-				continue
+	case exportDoneMsg:
+		m.exporting = false
+		m.exportDone = msg.path
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case " ":
+			if m.paused {
+				// Resume
+				elapsed := m.pauseOffset
+				m.player.Close()
+				m.sr.seekTo(m.posToBytes(elapsed))
+				m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
+				m.player.Play()
+				m.startTime = time.Now().Add(-elapsed)
+				m.paused = false
+			} else {
+				// Pause
+				m.pauseOffset = m.currentPosition()
+				m.player.Close()
+				m.paused = true
 			}
-			switch evt.kind {
-			case "space":
-				if paused {
-					player.Play()
-					paused = false
-				} else {
-					player.Pause()
-					paused = true
-				}
-				printStatus()
+			return m, nil
 
-			case "r":
-				repeat = !repeat
-				printStatus()
+		case "r":
+			m.repeat = !m.repeat
+			return m, nil
 
-			case "right":
-				seekDelta := int64(10 * bytesPerSecond)
-				if evt.shift {
-					seekDelta = 30 * bytesPerSecond
-				}
-				newOff := currentPos() + seekDelta
-				if newOff > int64(len(data)) {
-					newOff = int64(len(data))
-				}
-				sr.Seek(newOff, io.SeekStart)
-				player.Close()
-				player = ctx.NewPlayer(io.NopCloser(sr))
-				if !paused {
-					player.Play()
-				}
-				printStatus()
-
-			case "left":
-				seekDelta := int64(-10 * bytesPerSecond)
-				if evt.shift {
-					seekDelta = -30 * bytesPerSecond
-				}
-				newOff := currentPos() + seekDelta
-				if newOff < 0 {
-					newOff = 0
-				}
-				sr.Seek(newOff, io.SeekStart)
-				player.Close()
-				player = ctx.NewPlayer(io.NopCloser(sr))
-				if !paused {
-					player.Play()
-				}
-				printStatus()
-
-			case "q":
-				if stdoutTTY {
-					fmt.Println()
-				}
-				return nil
-
-			case "ctrlc":
-				keys.restore()
-				if stdoutTTY {
-					fmt.Println()
-				}
-				os.Exit(0)
+		case "w":
+			if !m.exporting {
+				m.exporting = true
+				m.exportDone = ""
+				ch := make(chan string, 1)
+				go func() {
+					if err := WriteWAV(m.wavOut, &m.fda.Info, m.data); err != nil {
+						fmt.Fprintf(os.Stderr, "\nExport error: %v\n", err)
+						ch <- ""
+					} else {
+						ch <- m.wavOut
+					}
+				}()
+				return m, waitForExport(ch)
 			}
 
-		case <-time.After(100 * time.Millisecond):
-			printStatus()
+		case "right":
+			delta := 10 * time.Second
+			if msg.Alt {
+				delta = 30 * time.Second
+			}
+			newPos := m.currentPosition() + delta
+			if newPos > m.total {
+				newPos = m.total
+			}
+			if !m.paused {
+				m.player.Close()
+			}
+			m.sr.seekTo(m.posToBytes(newPos))
+			if !m.paused {
+				m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
+				m.player.Play()
+				m.startTime = time.Now().Add(-newPos)
+			}
+			m.pauseOffset = newPos
+			return m, nil
+
+		case "left":
+			delta := -10 * time.Second
+			if msg.Alt {
+				delta = -30 * time.Second
+			}
+			newPos := m.currentPosition() + delta
+			if newPos < 0 {
+				newPos = 0
+			}
+			if !m.paused {
+				m.player.Close()
+			}
+			m.sr.seekTo(m.posToBytes(newPos))
+			if !m.paused {
+				m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
+				m.player.Play()
+				m.startTime = time.Now().Add(-newPos)
+			}
+			m.pauseOffset = newPos
+			return m, nil
+
+		case "q", "esc", "ctrl+c":
+			if !m.paused {
+				m.player.Close()
+			}
+			m.quit = true
+			return m, tea.Quit
 		}
 	}
+
+	return m, nil
+}
+
+func (m playerModel) currentPosition() time.Duration {
+	if m.paused {
+		return m.pauseOffset
+	}
+	pos := time.Since(m.startTime)
+	if pos > m.total {
+		pos = m.total
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	return pos
+}
+
+// posToBytes converts a time.Duration position to a byte offset in the PCM data.
+func (m playerModel) posToBytes(d time.Duration) int64 {
+	b := int64(float64(d) * float64(m.bytesPerSec) / float64(time.Second))
+	if b < 0 {
+		b = 0
+	}
+	if b > int64(len(m.data)) {
+		b = int64(len(m.data))
+	}
+	return b
+}
+
+func (m playerModel) View() string {
+	pos := m.currentPosition()
+	barWidth := 40
+	filled := 0
+	if m.total > 0 {
+		filled = int(float64(barWidth) * float64(pos) / float64(m.total))
+	}
+	if filled > barWidth {
+		filled = barWidth
+	}
+
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	state := "▶ "
+	if m.paused {
+		state = "⏸ "
+	}
+	tags := ""
+	if m.repeat {
+		tags += " 🔁"
+	}
+	if m.exporting {
+		tags += " 💾 exporting..."
+	}
+	if m.exportDone != "" {
+		tags += " ✓ exported"
+	}
+
+	return fmt.Sprintf("\n  %s %s %s / %s%s\n\n  %s\n",
+		state,
+		playerStyleBar.Render(bar),
+		playerStyleDim.Render(m.currentPosition().Truncate(time.Second).String()),
+		playerStyleDim.Render(m.total.Truncate(time.Second).String()),
+		playerStyleDim.Render(tags),
+		playerStyleHelp(),
+	)
+}
+
+func playerHelp() string {
+	return "Space: pause | ←/→: ±10s | Alt+←/→: ±30s | R: repeat | W: export WAV | Q: quit"
+}
+
+func lipglossStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+}
+
+func playerStyleHelp() string {
+	return lipglossStyle().Render("  " + playerHelp())
 }
