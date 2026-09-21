@@ -71,7 +71,6 @@ func playCmd(args []string) {
 	}
 }
 
-// playFile decodes a single FDA file in memory and plays it with a bubbletea UI.
 func playFile(path string) error {
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext != ".fda" {
@@ -151,14 +150,6 @@ func (r *seekableReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (r *seekableReader) remaining() int64 {
-	n := int64(len(r.data)) - r.offset
-	if n < 0 {
-		return 0
-	}
-	return n
-}
-
 func (r *seekableReader) seekTo(pos int64) {
 	if pos < 0 {
 		pos = 0
@@ -169,36 +160,49 @@ func (r *seekableReader) seekTo(pos int64) {
 	r.offset = pos
 }
 
+func (r *seekableReader) remaining() int64 {
+	n := int64(len(r.data)) - r.offset
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // ---------- bubbletea player ----------
 
 var (
-	playerStyleTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("170"))
-	playerStyleBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
-	playerStyleDim   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	playerStyleOK    = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
+	playerStyleBar = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+	playerStyleDim = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	playerStyleLog = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
 type playerTickMsg time.Time
 
 type playerModel struct {
-	data         []byte
-	sampleRate   int
-	channels     int
-	wavOut       string
-	fda          *FDAFile
-	sr           *seekableReader
-	player       *oto.Player
-	ctx          *oto.Context
-	bytesPerSec  int64
-	total        time.Duration
-	paused       bool
-	repeat       bool
-	exporting    bool
-	exportDone   string // non-empty after export finishes
-	startTime    time.Time
-	pauseOffset  time.Duration
-	pauseStarted time.Time
-	quit         bool
+	data        []byte
+	sampleRate  int
+	channels    int
+	wavOut      string
+	fda         *FDAFile
+	sr          *seekableReader
+	player      *oto.Player
+	ctx         *oto.Context
+	bytesPerSec int64
+	total       time.Duration
+
+	// State
+	paused     bool
+	repeat     bool
+	exporting  bool
+	exportDone string
+	quit       bool
+
+	// Position tracking: we track position purely via time since last start.
+	// On seek/pause/resume, we reset startTime to match the desired position.
+	startTime time.Time
+
+	// Logs (last N messages)
+	logs []string
 }
 
 func newPlayerModel(data []byte, sampleRate, channels int, wavOut string, fda *FDAFile) playerModel {
@@ -230,24 +234,61 @@ func newPlayerModel(data []byte, sampleRate, channels int, wavOut string, fda *F
 	}
 }
 
+func (m *playerModel) log(msg string) {
+	m.logs = append(m.logs, time.Now().Format("15:04:05.000")+" "+msg)
+	if len(m.logs) > 6 {
+		m.logs = m.logs[len(m.logs)-6:]
+	}
+}
+
+func (m *playerModel) currentPosition() time.Duration {
+	if m.paused {
+		return 0 // unused when paused; we use pausePos directly
+	}
+	pos := time.Since(m.startTime)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > m.total {
+		pos = m.total
+	}
+	return pos
+}
+
+func (m *playerModel) posToBytes(d time.Duration) int64 {
+	b := int64(float64(d) * float64(m.bytesPerSec) / float64(time.Second))
+	if b < 0 {
+		b = 0
+	}
+	if b > int64(len(m.data)) {
+		b = int64(len(m.data))
+	}
+	return b
+}
+
+// stopPlayer closes the current player safely (only if it exists).
+func (m *playerModel) stopPlayer() {
+	if m.player != nil {
+		m.player.Close()
+		m.player = nil
+	}
+}
+
+// startPlayerAt creates a new player reading from the given byte offset and starts playback.
+func (m *playerModel) startPlayerAt(byteOffset int64) {
+	m.sr.seekTo(byteOffset)
+	m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
+	m.player.Play()
+}
+
 func (m playerModel) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), waitForExport(nil))
+	return tickCmd()
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
 		return playerTickMsg(t)
 	})
-}
-
-func waitForExport(ch <-chan string) tea.Cmd {
-	return func() tea.Msg {
-		if ch == nil {
-			return nil
-		}
-		result := <-ch
-		return exportDoneMsg{path: result}
-	}
 }
 
 type exportDoneMsg struct{ path string }
@@ -261,55 +302,68 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quit {
 			return m, tea.Quit
 		}
+		if m.paused {
+			return m, tickCmd()
+		}
 		// Check end-of-file
-		if !m.paused && !m.player.IsPlaying() {
+		if !m.player.IsPlaying() {
 			if m.sr.remaining() <= 0 {
 				if m.repeat {
-					m.sr.seekTo(0)
-					m.player.Close()
-					m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
-					m.player.Play()
+					m.log("Repeat: restarting")
+					m.stopPlayer()
+					m.startPlayerAt(0)
 					m.startTime = time.Now()
 					return m, tickCmd()
 				}
+				m.log("Track ended")
 				return m, tea.Quit
 			}
+			// Small gap — wait for oto to catch up
 		}
 		return m, tickCmd()
 
 	case exportDoneMsg:
 		m.exporting = false
 		m.exportDone = msg.path
+		if msg.path != "" {
+			m.log("Exported: " + msg.path)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case " ":
 			if m.paused {
-				// Resume
-				elapsed := m.pauseOffset
-				m.player.Close()
-				m.sr.seekTo(m.posToBytes(elapsed))
-				m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
-				m.player.Play()
-				m.startTime = time.Now().Add(-elapsed)
+				// --- RESUME ---
+				pos := m.currentPosition()
+				m.log(fmt.Sprintf("Resume from %s, sr.offset=%d", pos.Truncate(time.Millisecond), m.sr.offset))
+				m.startPlayerAt(m.posToBytes(pos))
+				m.startTime = time.Now().Add(-pos)
 				m.paused = false
 			} else {
-				// Pause
-				m.pauseOffset = m.currentPosition()
-				m.player.Close()
+				// --- PAUSE ---
+				pos := m.currentPosition()
+				m.log(fmt.Sprintf("Pause at %s, sr.offset=%d", pos.Truncate(time.Millisecond), m.sr.offset))
+				m.stopPlayer()
 				m.paused = true
+				// Store position for resume. Use time-based position.
+				// We set startTime so that currentPosition() returns the right value.
+				// But since paused=true, currentPosition() isn't used.
+				// We store it in startTime directly for resume.
+				m.startTime = time.Now().Add(-pos) // so time.Since(startTime) == pos
 			}
 			return m, nil
 
 		case "r":
 			m.repeat = !m.repeat
+			m.log(fmt.Sprintf("Repeat: %v", m.repeat))
 			return m, nil
 
 		case "w":
 			if !m.exporting {
 				m.exporting = true
 				m.exportDone = ""
+				m.log("Exporting WAV...")
 				ch := make(chan string, 1)
 				go func() {
 					if err := WriteWAV(m.wavOut, &m.fda.Info, m.data); err != nil {
@@ -319,7 +373,10 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						ch <- m.wavOut
 					}
 				}()
-				return m, waitForExport(ch)
+				return m, func() tea.Msg {
+					result := <-ch
+					return exportDoneMsg{path: result}
+				}
 			}
 
 		case "right":
@@ -327,20 +384,26 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Alt {
 				delta = 30 * time.Second
 			}
-			newPos := m.currentPosition() + delta
+			var pos time.Duration
+			if m.paused {
+				pos = m.currentPosition()
+			} else {
+				pos = m.currentPosition()
+			}
+			newPos := pos + delta
 			if newPos > m.total {
 				newPos = m.total
 			}
+			m.log(fmt.Sprintf("Seek → %s (delta +%s)", newPos.Truncate(time.Millisecond), delta))
 			if !m.paused {
-				m.player.Close()
+				m.stopPlayer()
 			}
-			m.sr.seekTo(m.posToBytes(newPos))
-			if !m.paused {
-				m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
-				m.player.Play()
-				m.startTime = time.Now().Add(-newPos)
+			m.startPlayerAt(m.posToBytes(newPos))
+			m.startTime = time.Now().Add(-newPos)
+			if m.paused {
+				// Stay paused but update position
+				m.stopPlayer()
 			}
-			m.pauseOffset = newPos
 			return m, nil
 
 		case "left":
@@ -348,26 +411,25 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Alt {
 				delta = -30 * time.Second
 			}
-			newPos := m.currentPosition() + delta
+			pos := m.currentPosition()
+			newPos := pos + delta
 			if newPos < 0 {
 				newPos = 0
 			}
+			m.log(fmt.Sprintf("Seek ← %s (delta %s)", newPos.Truncate(time.Millisecond), delta))
 			if !m.paused {
-				m.player.Close()
+				m.stopPlayer()
 			}
-			m.sr.seekTo(m.posToBytes(newPos))
-			if !m.paused {
-				m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
-				m.player.Play()
-				m.startTime = time.Now().Add(-newPos)
+			m.startPlayerAt(m.posToBytes(newPos))
+			m.startTime = time.Now().Add(-newPos)
+			if m.paused {
+				m.stopPlayer()
 			}
-			m.pauseOffset = newPos
 			return m, nil
 
 		case "q", "esc", "ctrl+c":
-			if !m.paused {
-				m.player.Close()
-			}
+			m.log("Quit")
+			m.stopPlayer()
 			m.quit = true
 			return m, tea.Quit
 		}
@@ -376,34 +438,14 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m playerModel) currentPosition() time.Duration {
-	if m.paused {
-		return m.pauseOffset
-	}
-	pos := time.Since(m.startTime)
-	if pos > m.total {
-		pos = m.total
-	}
-	if pos < 0 {
-		pos = 0
-	}
-	return pos
-}
-
-// posToBytes converts a time.Duration position to a byte offset in the PCM data.
-func (m playerModel) posToBytes(d time.Duration) int64 {
-	b := int64(float64(d) * float64(m.bytesPerSec) / float64(time.Second))
-	if b < 0 {
-		b = 0
-	}
-	if b > int64(len(m.data)) {
-		b = int64(len(m.data))
-	}
-	return b
-}
-
 func (m playerModel) View() string {
-	pos := m.currentPosition()
+	var pos time.Duration
+	if m.paused {
+		pos = m.currentPosition()
+	} else {
+		pos = m.currentPosition()
+	}
+
 	barWidth := 40
 	filled := 0
 	if m.total > 0 {
@@ -427,27 +469,26 @@ func (m playerModel) View() string {
 		tags += " 💾 exporting..."
 	}
 	if m.exportDone != "" {
-		tags += " ✓ exported"
+		tags += " ✓"
 	}
 
-	return fmt.Sprintf("\n  %s %s %s / %s%s\n\n  %s\n",
+	// Status line
+	status := fmt.Sprintf("  %s %s  %s / %s%s",
 		state,
 		playerStyleBar.Render(bar),
-		playerStyleDim.Render(m.currentPosition().Truncate(time.Second).String()),
+		playerStyleDim.Render(pos.Truncate(time.Second).String()),
 		playerStyleDim.Render(m.total.Truncate(time.Second).String()),
 		playerStyleDim.Render(tags),
-		playerStyleHelp(),
 	)
-}
 
-func playerHelp() string {
-	return "Space: pause | ←/→: ±10s | Alt+←/→: ±30s | R: repeat | W: export WAV | Q: quit"
-}
+	// Help line
+	help := playerStyleDim.Render("  Space: pause | ←/→: ±10s | Alt+←/→: ±30s | R: repeat | W: export WAV | Q: quit")
 
-func lipglossStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-}
+	// Logs
+	var logLines strings.Builder
+	for _, l := range m.logs {
+		logLines.WriteString(playerStyleLog.Render("  📋 "+l) + "\n")
+	}
 
-func playerStyleHelp() string {
-	return lipglossStyle().Render("  " + playerHelp())
+	return "\n" + status + "\n\n" + help + "\n\n" + logLines.String()
 }
