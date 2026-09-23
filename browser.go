@@ -21,12 +21,12 @@ var (
 
 // browserModel is the bubbletea model for the FDA file browser.
 type browserModel struct {
-	files   []string
-	cwd     string
-	cursor  int
-	playing bool
-	width   int
-	height  int
+	files    []string
+	cwd      string
+	cursor   int
+	selected string // file chosen for playback; empty means "quit the program"
+	width    int
+	height   int
 }
 
 func browserInit() browserModel {
@@ -47,7 +47,7 @@ func (m browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		switch msg.String() {
+		switch layoutKey(msg.String()) {
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -60,26 +60,24 @@ func (m browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.files) == 0 {
 				return m, tea.Quit
 			}
-			return m, m.playSelected()
+			// Leave the browser: browserMode plays the file and then
+			// restarts the browser with this state restored. Ending the
+			// program here (instead of nesting a second tea.Program inside
+			// a Cmd) guarantees that only one program owns stdin at a time,
+			// so player keys can never leak into the browser (and vice
+			// versa — the browser used to swallow ↑/↓/Enter during
+			// playback, letting a second track start on top of the first).
+			m.selected = m.files[m.cursor]
+			return m, tea.Quit
 		case "q", "esc", "ctrl+c":
+			// From the browser Q exits the whole program.
+			m.selected = ""
 			return m, tea.Quit
 		}
 	}
 
 	return m, nil
 }
-
-func (m browserModel) playSelected() tea.Cmd {
-	return func() tea.Msg {
-		playPath := filepath.Join(m.cwd, m.files[m.cursor])
-		if err := playFile(playPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
-		return playDoneMsg{}
-	}
-}
-
-type playDoneMsg struct{}
 
 func (m browserModel) View() string {
 	if len(m.files) == 0 {
@@ -131,17 +129,35 @@ func (m browserModel) View() string {
 	return b.String()
 }
 
-// browserMode runs the interactive file browser.
+// browserMode runs the interactive file browser. It alternates strictly
+// between ONE browser tea.Program and ONE player tea.Program: pressing Enter
+// ends the browser, the file plays, and the browser restarts with its cursor
+// restored. This way no two programs ever read stdin at the same time.
 func browserMode() {
 	m := browserInit()
 	if len(m.files) == 0 {
 		fmt.Println("No .fda files found in the current directory.")
 		return
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	for {
+		p := tea.NewProgram(m, tea.WithAltScreen())
+		result, err := p.Run()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if rm, ok := result.(browserModel); ok {
+			m = rm // keep cursor and selection state
+		}
+		if m.selected == "" {
+			return // Q / Esc / Ctrl+C in the browser — exit the program
+		}
+
+		playPath := filepath.Join(m.cwd, m.selected)
+		if err := playFile(playPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		m.selected = "" // back to the browser for the next round
 	}
 }
 

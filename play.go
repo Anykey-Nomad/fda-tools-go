@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,10 +98,14 @@ func playFile(path string) error {
 
 	m := newPlayerModel(data, sampleRate, channels, wavOut, fda)
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		return err
+	finalModel, err := p.Run()
+	// Deterministically silence this track before returning: oto's
+	// Player.Close() is a no-op, so stop it explicitly. The model is
+	// dropped right after, and oto's finalizer closes the player later.
+	if fm, ok := finalModel.(playerModel); ok && fm.player != nil {
+		fm.player.PauseAndStopReading()
 	}
-	return nil
+	return err
 }
 
 // ---------- oto singleton ----------
@@ -134,38 +139,158 @@ func getOtoContext(sampleRate, channels int) (*oto.Context, error) {
 	return otoCtx, nil
 }
 
-// ---------- seekable reader ----------
+// ---------- chunked PCM buffer ----------
 
-type seekableReader struct {
-	data   []byte
-	offset int64
+// chunkMillis is the fixed length of one playback chunk (~50 ms). Every
+// pause/seek position snaps to a multiple of this quantum, so playback can
+// only ever start at a chunk (and therefore sample-frame) boundary.
+const chunkMillis = 50
+
+// chunkBuffer holds the decoded PCM split into fixed ~50 ms chunks in a map.
+// Chunks are zero-copy slices of the original decode buffer; the map keeps
+// the structure O(1)-addressable by index and leaves room for lazily
+// loading/evicting chunks later without changing the addressing scheme.
+type chunkBuffer struct {
+	chunks     map[int][]byte
+	chunkBytes int // nominal chunk size; the last chunk may be shorter
+	numChunks  int
+	totalBytes int
 }
 
-func (r *seekableReader) Read(p []byte) (int, error) {
-	if r.offset >= int64(len(r.data)) {
-		return 0, io.EOF
+func newChunkBuffer(data []byte, sampleRate, channels int) *chunkBuffer {
+	bytesPerSample := channels * 2
+	// Samples per chunk = sampleRate * 50ms, rounded to a whole sample.
+	samples := (sampleRate*chunkMillis + 500) / 1000
+	if samples < 1 {
+		samples = 1
 	}
-	n := copy(p, r.data[r.offset:])
-	r.offset += int64(n)
-	return n, nil
+
+	cb := &chunkBuffer{
+		chunks:     make(map[int][]byte),
+		chunkBytes: samples * bytesPerSample,
+	}
+	for off, i := 0, 0; off < len(data); i++ {
+		end := off + cb.chunkBytes
+		if end > len(data) {
+			end = len(data)
+		}
+		cb.chunks[i] = data[off:end] // zero copy: subslice of the decode buffer
+		off = end
+		cb.numChunks = i + 1
+	}
+	cb.totalBytes = len(data)
+	return cb
 }
 
-func (r *seekableReader) seekTo(pos int64) {
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > int64(len(r.data)) {
-		pos = int64(len(r.data))
-	}
-	r.offset = pos
+// chunkSource is the io.Reader + io.Seeker that oto consumes. It serves PCM
+// straight out of the chunk map and snaps every seek down to a chunk
+// boundary, so seeks can never land mid-sample (which produced white noise).
+type chunkSource struct {
+	cb *chunkBuffer
+
+	mu  sync.Mutex
+	idx int // index of the current chunk
+	off int // byte offset inside the current chunk
 }
 
-func (r *seekableReader) remaining() int64 {
-	n := int64(len(r.data)) - r.offset
+func (s *chunkSource) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	total := 0
+	for total < len(p) {
+		if s.idx >= s.cb.numChunks {
+			return total, io.EOF
+		}
+		ch := s.cb.chunks[s.idx]
+		n := copy(p[total:], ch[s.off:])
+		total += n
+		s.off += n
+		if s.off >= len(ch) {
+			s.idx++
+			s.off = 0
+		}
+	}
+	return total, nil
+}
+
+// bytePosLocked returns the absolute byte position; the caller holds s.mu.
+func (s *chunkSource) bytePosLocked() int64 {
+	if s.idx >= s.cb.numChunks {
+		return int64(s.cb.totalBytes)
+	}
+	return int64(s.idx*s.cb.chunkBytes + s.off)
+}
+
+func (s *chunkSource) bytePos() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bytePosLocked()
+}
+
+func (s *chunkSource) remaining() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := int64(s.cb.totalBytes) - s.bytePosLocked()
 	if n < 0 {
 		return 0
 	}
 	return n
+}
+
+// Seek implements io.Seeker (required by oto.Player.Seek) and snaps the
+// result down to the nearest chunk boundary.
+func (s *chunkSource) Seek(offset int64, whence int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = s.bytePosLocked() + offset
+	case io.SeekEnd:
+		abs = int64(s.cb.totalBytes) + offset
+	default:
+		return 0, errors.New("chunkSource: invalid whence")
+	}
+
+	if abs < 0 {
+		abs = 0
+	}
+	if abs >= int64(s.cb.totalBytes) {
+		s.idx = s.cb.numChunks
+		s.off = 0
+		return int64(s.cb.totalBytes), nil
+	}
+	// Snap down to the chunk grid — the seek quantum.
+	abs -= abs % int64(s.cb.chunkBytes)
+	s.idx = int(abs) / s.cb.chunkBytes
+	s.off = 0
+	return abs, nil
+}
+
+// layoutKey normalizes a key description so that letter hotkeys work no
+// matter which keyboard layout is active. It lowercases the string (Shift
+// and CapsLock stop mattering) and maps Cyrillic characters from the
+// ЙЦУКЕН layout to the Latin letter of the same physical key
+// (ц→q, у→w, к→r, о→j, л→k). Non-letter keys pass through unchanged.
+func layoutKey(s string) string {
+	s = strings.ToLower(s)
+	switch s {
+	case "ц":
+		return "q"
+	case "у":
+		return "w"
+	case "к":
+		return "r"
+	case "о":
+		return "j"
+	case "л":
+		return "k"
+	}
+	return s
 }
 
 // ---------- bubbletea player ----------
@@ -184,9 +309,9 @@ type playerModel struct {
 	channels    int
 	wavOut      string
 	fda         *FDAFile
-	sr          *seekableReader
+	cb          *chunkBuffer
+	src         *chunkSource
 	player      *oto.Player
-	ctx         *oto.Context
 	bytesPerSec int64
 	total       time.Duration
 
@@ -196,12 +321,9 @@ type playerModel struct {
 	exporting  bool
 	exportDone string
 	quit       bool
+	volumePct  int // 0..200, applied via Player.SetVolume
 
-	// Position tracking: we track position purely via time since last start.
-	// On seek/pause/resume, we reset startTime to match the desired position.
-	startTime time.Time
-
-	// Logs (last N messages)
+	// Logs
 	logs []string
 }
 
@@ -212,73 +334,98 @@ func newPlayerModel(data []byte, sampleRate, channels int, wavOut string, fda *F
 		os.Exit(1)
 	}
 
-	sr := &seekableReader{data: data}
-	player := ctx.NewPlayer(io.NopCloser(sr))
+	bps := int64(sampleRate * channels * 2)
+	cb := newChunkBuffer(data, sampleRate, channels)
+	src := &chunkSource{cb: cb}
+
+	// Exactly ONE player per track, created once and never recreated:
+	// oto v3.5's Player.Close() is a no-op (cleanup happens via GC
+	// finalizer), so re-creating players left "zombie" players reading the
+	// same source concurrently — that was the cause of the unstoppable
+	// sound, the white noise and the racing track. Pause goes through
+	// PauseAndStopReading(), seek through Player.Seek().
+	player := ctx.NewPlayer(src)
 	player.Play()
 
-	bps := int64(sampleRate * channels * 2)
-	total := time.Duration(float64(len(data)) / float64(bps) * float64(time.Second))
-
-	return playerModel{
+	m := playerModel{
 		data:        data,
 		sampleRate:  sampleRate,
 		channels:    channels,
 		wavOut:      wavOut,
 		fda:         fda,
-		sr:          sr,
+		cb:          cb,
+		src:         src,
 		player:      player,
-		ctx:         ctx,
 		bytesPerSec: bps,
-		total:       total,
-		startTime:   time.Now(),
+		total:       time.Duration(float64(len(data)) / float64(bps) * float64(time.Second)),
+		volumePct:   100,
 	}
+
+	// An oto context lives for the whole process (one format only). Warn if
+	// this file's format does not match it — playback would sound wrong.
+	if otoSampleRate != sampleRate || otoChannels != channels {
+		m.log(fmt.Sprintf("⚠ context is %d Hz/%d ch but file is %d Hz/%d ch",
+			otoSampleRate, otoChannels, sampleRate, channels))
+	}
+	return m
 }
 
 func (m *playerModel) log(msg string) {
 	m.logs = append(m.logs, time.Now().Format("15:04:05.000")+" "+msg)
-	if len(m.logs) > 6 {
-		m.logs = m.logs[len(m.logs)-6:]
+	if len(m.logs) > 8 {
+		m.logs = m.logs[len(m.logs)-8:]
 	}
 }
 
-func (m *playerModel) currentPosition() time.Duration {
-	if m.paused {
-		return 0 // unused when paused; we use pausePos directly
+// pos returns the position that has actually been heard: bytes pulled from
+// the source minus what is still sitting in oto's hardware buffer, snapped
+// down to the chunk grid. While paused nothing moves, so the value freezes
+// exactly at the pause point.
+func (m *playerModel) pos() time.Duration {
+	read := m.src.bytePos()
+	buffered := int64(m.player.BufferedSize())
+	heard := read - buffered
+	if heard < 0 {
+		heard = 0
 	}
-	pos := time.Since(m.startTime)
-	if pos < 0 {
-		pos = 0
+	if heard >= int64(m.cb.totalBytes) {
+		return m.total
 	}
-	if pos > m.total {
-		pos = m.total
+	if m.cb.chunkBytes > 0 {
+		heard -= heard % int64(m.cb.chunkBytes)
 	}
-	return pos
+	return time.Duration(float64(heard) / float64(m.bytesPerSec) * float64(time.Second))
 }
 
-func (m *playerModel) posToBytes(d time.Duration) int64 {
-	b := int64(float64(d) * float64(m.bytesPerSec) / float64(time.Second))
-	if b < 0 {
-		b = 0
+func (m *playerModel) chunkIndex() int64 {
+	b := int64(float64(m.pos()) / float64(time.Second) * float64(m.bytesPerSec))
+	if m.cb.chunkBytes <= 0 {
+		return 0
 	}
-	if b > int64(len(m.data)) {
-		b = int64(len(m.data))
-	}
-	return b
+	return b / int64(m.cb.chunkBytes)
 }
 
-// stopPlayer closes the current player safely (only if it exists).
-func (m *playerModel) stopPlayer() {
-	if m.player != nil {
-		m.player.Close()
-		m.player = nil
+// seekBy moves ±delta, snapped to the chunk grid, via Player.Seek. oto
+// handles the hard parts: it flushes its internal buffer, waits out any
+// in-flight read, discards stale read results, repositions our source and
+// keeps playing (or stays paused) exactly as before the seek.
+func (m *playerModel) seekBy(delta time.Duration) {
+	target := m.pos() + delta
+	if target < 0 {
+		target = 0
 	}
-}
-
-// startPlayerAt creates a new player reading from the given byte offset and starts playback.
-func (m *playerModel) startPlayerAt(byteOffset int64) {
-	m.sr.seekTo(byteOffset)
-	m.player = m.ctx.NewPlayer(io.NopCloser(m.sr))
-	m.player.Play()
+	if target > m.total {
+		target = m.total
+	}
+	b := int64(float64(target) / float64(time.Second) * float64(m.bytesPerSec))
+	if m.cb.chunkBytes > 0 {
+		b -= b % int64(m.cb.chunkBytes)
+	}
+	if _, err := m.player.Seek(b, io.SeekStart); err != nil {
+		m.log("Seek error: " + err.Error())
+		return
+	}
+	m.log(fmt.Sprintf("Seek %+s → %s (chunk %d)", delta, target.Truncate(time.Millisecond), b/int64(m.cb.chunkBytes)))
 }
 
 func (m playerModel) Init() tea.Cmd {
@@ -302,23 +449,30 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quit {
 			return m, tea.Quit
 		}
-		if m.paused {
-			return m, tickCmd()
-		}
-		// Check end-of-file
-		if !m.player.IsPlaying() {
-			if m.sr.remaining() <= 0 {
+		if !m.paused && m.player != nil && !m.player.IsPlaying() {
+			if err := m.player.Err(); err != nil {
+				m.log("Audio error: " + err.Error())
+				m.quit = true
+				return m, tea.Quit
+			}
+			if m.src.remaining() <= 0 {
 				if m.repeat {
-					m.log("Repeat: restarting")
-					m.stopPlayer()
-					m.startPlayerAt(0)
-					m.startTime = time.Now()
+					if _, err := m.player.Seek(0, io.SeekStart); err != nil {
+						m.log("Repeat error: " + err.Error())
+						m.quit = true
+						return m, tea.Quit
+					}
+					m.player.Play()
+					m.log("Repeat: restart from chunk 0")
 					return m, tickCmd()
 				}
 				m.log("Track ended")
+				m.player.PauseAndStopReading()
+				m.quit = true
 				return m, tea.Quit
 			}
-			// Small gap — wait for oto to catch up
+			// Not at EOF but stopped and no error: nudge it back to life.
+			m.player.Play()
 		}
 		return m, tickCmd()
 
@@ -331,27 +485,35 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		switch msg.String() {
+		key := layoutKey(msg.String())
+		switch key {
 		case " ":
 			if m.paused {
-				// --- RESUME ---
-				pos := m.currentPosition()
-				m.log(fmt.Sprintf("Resume from %s, sr.offset=%d", pos.Truncate(time.Millisecond), m.sr.offset))
-				m.startPlayerAt(m.posToBytes(pos))
-				m.startTime = time.Now().Add(-pos)
+				m.player.Play()
 				m.paused = false
+				m.log(fmt.Sprintf("▶ resume at %s (chunk %d)", m.pos().Truncate(time.Millisecond), m.chunkIndex()))
 			} else {
-				// --- PAUSE ---
-				pos := m.currentPosition()
-				m.log(fmt.Sprintf("Pause at %s, sr.offset=%d", pos.Truncate(time.Millisecond), m.sr.offset))
-				m.stopPlayer()
+				m.player.PauseAndStopReading()
 				m.paused = true
-				// Store position for resume. Use time-based position.
-				// We set startTime so that currentPosition() returns the right value.
-				// But since paused=true, currentPosition() isn't used.
-				// We store it in startTime directly for resume.
-				m.startTime = time.Now().Add(-pos) // so time.Since(startTime) == pos
+				m.log(fmt.Sprintf("⏸ pause at %s (chunk %d, oto buf %d B)",
+					m.pos().Truncate(time.Millisecond), m.chunkIndex(), m.player.BufferedSize()))
 			}
+			return m, nil
+
+		case "up", "down":
+			step := 10
+			if key == "down" {
+				step = -10
+			}
+			m.volumePct += step
+			if m.volumePct < 0 {
+				m.volumePct = 0
+			}
+			if m.volumePct > 200 {
+				m.volumePct = 200
+			}
+			m.player.SetVolume(float64(m.volumePct) / 100)
+			m.log(fmt.Sprintf("Volume: %d%%", m.volumePct))
 			return m, nil
 
 		case "r":
@@ -379,57 +541,25 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "right":
+		case "right", "alt+right", "shift+right":
 			delta := 10 * time.Second
-			if msg.Alt {
+			if msg.Alt || strings.HasPrefix(key, "shift+") {
 				delta = 30 * time.Second
 			}
-			var pos time.Duration
-			if m.paused {
-				pos = m.currentPosition()
-			} else {
-				pos = m.currentPosition()
-			}
-			newPos := pos + delta
-			if newPos > m.total {
-				newPos = m.total
-			}
-			m.log(fmt.Sprintf("Seek → %s (delta +%s)", newPos.Truncate(time.Millisecond), delta))
-			if !m.paused {
-				m.stopPlayer()
-			}
-			m.startPlayerAt(m.posToBytes(newPos))
-			m.startTime = time.Now().Add(-newPos)
-			if m.paused {
-				// Stay paused but update position
-				m.stopPlayer()
-			}
+			m.seekBy(delta)
 			return m, nil
 
-		case "left":
+		case "left", "alt+left", "shift+left":
 			delta := -10 * time.Second
-			if msg.Alt {
+			if msg.Alt || strings.HasPrefix(key, "shift+") {
 				delta = -30 * time.Second
 			}
-			pos := m.currentPosition()
-			newPos := pos + delta
-			if newPos < 0 {
-				newPos = 0
-			}
-			m.log(fmt.Sprintf("Seek ← %s (delta %s)", newPos.Truncate(time.Millisecond), delta))
-			if !m.paused {
-				m.stopPlayer()
-			}
-			m.startPlayerAt(m.posToBytes(newPos))
-			m.startTime = time.Now().Add(-newPos)
-			if m.paused {
-				m.stopPlayer()
-			}
+			m.seekBy(delta)
 			return m, nil
 
 		case "q", "esc", "ctrl+c":
 			m.log("Quit")
-			m.stopPlayer()
+			m.player.PauseAndStopReading()
 			m.quit = true
 			return m, tea.Quit
 		}
@@ -439,17 +569,12 @@ func (m playerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m playerModel) View() string {
-	var pos time.Duration
-	if m.paused {
-		pos = m.currentPosition()
-	} else {
-		pos = m.currentPosition()
-	}
+	p := m.pos()
 
 	barWidth := 40
 	filled := 0
 	if m.total > 0 {
-		filled = int(float64(barWidth) * float64(pos) / float64(m.total))
+		filled = int(float64(barWidth) * float64(p) / float64(m.total))
 	}
 	if filled > barWidth {
 		filled = barWidth
@@ -461,7 +586,11 @@ func (m playerModel) View() string {
 	if m.paused {
 		state = "⏸ "
 	}
-	tags := ""
+	volIcon := "🔊"
+	if m.volumePct == 0 {
+		volIcon = "🔇"
+	}
+	tags := fmt.Sprintf(" %s%d%%", volIcon, m.volumePct)
 	if m.repeat {
 		tags += " 🔁"
 	}
@@ -472,19 +601,16 @@ func (m playerModel) View() string {
 		tags += " ✓"
 	}
 
-	// Status line
 	status := fmt.Sprintf("  %s %s  %s / %s%s",
 		state,
 		playerStyleBar.Render(bar),
-		playerStyleDim.Render(pos.Truncate(time.Second).String()),
+		playerStyleDim.Render(p.Truncate(time.Second).String()),
 		playerStyleDim.Render(m.total.Truncate(time.Second).String()),
 		playerStyleDim.Render(tags),
 	)
 
-	// Help line
-	help := playerStyleDim.Render("  Space: pause | ←/→: ±10s | Alt+←/→: ±30s | R: repeat | W: export WAV | Q: quit")
+	help := playerStyleDim.Render("  Space: pause | ←/→: ±10s | Alt+←/→: ±30s | ↑/↓: volume | R: repeat | W: export WAV | Q: back/quit")
 
-	// Logs
 	var logLines strings.Builder
 	for _, l := range m.logs {
 		logLines.WriteString(playerStyleLog.Render("  📋 "+l) + "\n")
