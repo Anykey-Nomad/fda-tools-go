@@ -45,7 +45,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
 	fmt.Fprintf(os.Stderr, "  fda-tools-go play <file.fda>                - Play FDA directly (no WAV on disk)\n")
 	fmt.Fprintf(os.Stderr, "  fda-tools-go decode [options] <input.fda>   - Decode FDA to WAV\n")
-	fmt.Fprintf(os.Stderr, "  fda-tools-go encode [options] <input.wav>   - Encode WAV to FDA\n\n")
+	fmt.Fprintf(os.Stderr, "  fda-tools-go encode [options] <input.wav>   - Encode WAV to FDA\n")
+	fmt.Fprintf(os.Stderr, "  fda-tools-go <archive.sga>                  - Browse an SGA archive (also via Drag & Drop)\n\n")
 	fmt.Fprintf(os.Stderr, "Decode options:\n")
 	fmt.Fprintf(os.Stderr, "  -info    Show FDA file info without conversion\n")
 	fmt.Fprintf(os.Stderr, "  -o       Output WAV file path\n\n")
@@ -210,17 +211,23 @@ func dragDropCmd() {
 			fmt.Printf("Folder done: %d converted, %d skipped\n\n", converted, skipped)
 		} else {
 			ext := strings.ToLower(filepath.Ext(item))
-			if ext != ".fda" && ext != ".wav" {
+			switch ext {
+			case ".sga":
+				// An archive dropped onto the exe opens in the interactive
+				// browser instead of being converted.
+				browserModeSGA(item)
+				return
+			case ".fda", ".wav":
+				if err := convertFile(item, "", bitrate); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					totalFailed++
+					continue
+				}
+				totalConverted++
+				fmt.Println()
+			default:
 				fmt.Fprintf(os.Stderr, "Skipping %s: unsupported file type\n", item)
-				continue
 			}
-			if err := convertFile(item, "", bitrate); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				totalFailed++
-				continue
-			}
-			totalConverted++
-			fmt.Println()
 		}
 	}
 

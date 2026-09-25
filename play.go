@@ -83,6 +83,13 @@ func playFile(path string) error {
 	if err != nil {
 		return err
 	}
+	return playFDA(fda, path)
+}
+
+// playFDA runs the interactive player for an already-parsed FDA file.
+// label is the human-readable source (a disk path, or an entry name inside
+// an SGA archive) and decides where the W-key WAV export is written.
+func playFDA(fda *FDAFile, label string) error {
 	fda.PrintInfo()
 
 	fmt.Printf("\nDecoding with Relic Codec...\n")
@@ -91,7 +98,18 @@ func playFile(path string) error {
 		return err
 	}
 
-	wavOut := strings.TrimSuffix(path, filepath.Ext(path)) + ".wav"
+	// FDA→WAV is always written outside the archive — next to the exe/cwd,
+	// never back into an .sga. Disk files keep their directory, in-archive
+	// entries (short name like "foo.fda") are written to the current directory.
+	var wavOut string
+	if strings.Contains(label, ":") || strings.Contains(label, "/") || strings.Contains(label, string(os.PathSeparator)) {
+		// Disk path like C:\foo\bar.fda — keep its directory.
+		wavOut = strings.TrimSuffix(label, filepath.Ext(label)) + ".wav"
+	} else {
+		base := strings.TrimSuffix(filepath.Base(strings.ReplaceAll(label, "\\", "/")), filepath.Ext(label)) + ".wav"
+		cwd, _ := os.Getwd()
+		wavOut = filepath.Join(cwd, base)
+	}
 	data := pcmDataToBytes(pcm)
 	sampleRate := int(fda.Info.SampleRate)
 	channels := int(fda.Info.Channels)

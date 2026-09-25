@@ -25,10 +25,10 @@ const (
 
 // FDAFile represents a parsed FDA audio file
 type FDAFile struct {
-	Header   FDAHeader
-	FBIF     FBIFChunk
-	Info     INFOChunk
-	RawData  []byte
+	Header  FDAHeader
+	FBIF    FBIFChunk
+	Info    INFOChunk
+	RawData []byte
 }
 
 // FDAHeader is the file header (24 bytes)
@@ -82,14 +82,19 @@ type DATAChunk struct {
 	DataSize uint32
 }
 
-// ParseFDA reads and parses an FDA file
+// ParseFDA reads and parses an FDA file from disk.
 func ParseFDA(filename string) (*FDAFile, error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
+	return ParseFDAReader(f)
+}
 
+// ParseFDAReader parses an FDA image from any reader — this is how FDA
+// files extracted from SGA archives are parsed (no temp file on disk).
+func ParseFDAReader(f io.Reader) (*FDAFile, error) {
 	file := &FDAFile{}
 
 	// Read header
